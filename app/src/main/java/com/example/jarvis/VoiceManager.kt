@@ -2,6 +2,7 @@ package com.example.jarvis
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
@@ -17,6 +18,7 @@ import java.io.IOException
 
 class VoiceManager(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO + Job())
+    
     private var recognizer: OnlineRecognizer? = null
     private var stream: OnlineStream? = null
     private var tts: OfflineTts? = null
@@ -40,19 +42,22 @@ class VoiceManager(private val context: Context) {
 
     init {
         scope.launch {
+            // Pehle assets copy karein
+            val espeakDataPath = copyAssetFolder("espeak-ng-data")
             initSTT()
-            initTTS()
+            initTTS(espeakDataPath)
         }
     }
 
     private fun initSTT() {
         try {
-            val encoder = copyAsset("tiny-encoder.int8.onnx")
-            val decoder = copyAsset("tiny-decoder.int8.onnx")
-            val tokens = copyAsset("tokens.txt")
+            Log.d("VoiceManager", "Initializing STT...")
+            val encoder = copyAssetFile("tiny-encoder.int8.onnx")
+            val decoder = copyAssetFile("tiny-decoder.int8.onnx")
+            val tokens = copyAssetFile("tokens.txt")
 
             if (encoder == null || decoder == null || tokens == null) {
-                Log.e("VoiceManager", "Missing STT assets for Whisper")
+                Log.e("VoiceManager", "CRITICAL: Missing STT assets")
                 return
             }
 
@@ -89,13 +94,15 @@ class VoiceManager(private val context: Context) {
         }
     }
 
-    private fun initTTS() {
+    // Updated initTTS to accept espeak path
+    private fun initTTS(espeakDataPath: String?) {
         try {
-            val model = copyAsset("model-pratham.onnx")
-            val tokens = copyAsset("tokens-pratham.txt")
+            Log.d("VoiceManager", "Initializing TTS...")
+            val model = copyAssetFile("model-pratham.onnx")
+            val tokens = copyAssetFile("tokens-pratham.txt")
 
             if (model == null || tokens == null) {
-                Log.e("VoiceManager", "Missing TTS assets")
+                Log.e("VoiceManager", "CRITICAL: Missing TTS assets")
                 return
             }
             
@@ -104,6 +111,10 @@ class VoiceManager(private val context: Context) {
                     vits = OfflineTtsVitsModelConfig().apply {
                         this.model = model
                         this.tokens = tokens
+                        // Agar espeak data mila hai, to uska path set karein
+                        if (espeakDataPath != null) {
+                            this.dataDir = espeakDataPath
+                        }
                         noiseScale = 0.667f
                         noiseScaleW = 0.8f
                         lengthScale = 1.0f
@@ -117,74 +128,66 @@ class VoiceManager(private val context: Context) {
             Log.i("VoiceManager", "TTS Initialized")
         } catch (e: Exception) {
             Log.e("VoiceManager", "Error initializing TTS: ${e.message}")
+            e.printStackTrace()
         }
     }
+
+    // ... existing listening/speaking code ...
 
     @SuppressLint("MissingPermission")
     fun startListening() {
         if (isRecording) return
         if (recognizer == null) {
-            Log.e("VoiceManager", "Recognizer not initialized")
+            Log.w("VoiceManager", "Recognizer not ready")
             return
         }
         
-        // Reset or recreate stream if needed
-        if (stream == null) {
-             stream = recognizer?.createStream()
-        }
+        if (stream == null) stream = recognizer?.createStream()
 
-        val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-        if (bufferSize == AudioRecord.ERROR || bufferSize == AudioRecord.ERROR_BAD_VALUE) {
-             Log.e("VoiceManager", "Invalid buffer size")
-             return
-        }
+        val minBuff = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+        val bufferSize = maxOf(minBuff, 4096)
         
-        audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+        try {
+            audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+            audioRecord?.startRecording()
+            isRecording = true
+            _isListening.value = true
 
-        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e("VoiceManager", "AudioRecord init failed")
-            return
-        }
-
-        audioRecord?.startRecording()
-        isRecording = true
-        _isListening.value = true
-
-        recordingJob = scope.launch(Dispatchers.IO) {
-            val buffer = ShortArray(bufferSize / 2)
-            while (isRecording && isActive) {
-                val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                if (read > 0) {
-                    val floatArray = FloatArray(read) { buffer[it] / 32768f }
-                    
-                    // Update visualizer level
-                    var maxAmp = 0f
-                    for (s in floatArray) {
-                        val abs = Math.abs(s)
-                        if (abs > maxAmp) maxAmp = abs
-                    }
-                    _audioLevel.value = maxAmp
-
-                    stream?.acceptWaveform(floatArray, sampleRate)
-                    
-                    while (recognizer?.isReady(stream) == true) {
-                        recognizer?.decode(stream)
-                    }
-                    
-                    val text = recognizer?.getResult(stream)?.text
-                    if (!text.isNullOrEmpty()) {
-                        val cleanText = text.lowercase().trim()
-                        if (_recognizedText.value != cleanText) {
-                             _recognizedText.value = cleanText
+            recordingJob = scope.launch(Dispatchers.IO) {
+                val buffer = ShortArray(1024)
+                while (isRecording && isActive) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0) {
+                        val floatArray = FloatArray(read) { buffer[it] / 32768f }
+                        
+                        var maxAmp = 0f
+                        for (s in floatArray) {
+                            if (Math.abs(s) > maxAmp) maxAmp = Math.abs(s)
                         }
-                    }
-                    
-                    if (recognizer?.isEndpoint(stream) == true) {
-                         Log.i("VoiceManager", "Endpoint detected")
-                         recognizer?.reset(stream)
+                        _audioLevel.value = maxAmp
+
+                        stream?.acceptWaveform(floatArray, sampleRate)
+                        while (recognizer?.isReady(stream) == true) {
+                            recognizer?.decode(stream)
+                        }
+                        
+                        val text = recognizer?.getResult(stream)?.text
+                        if (!text.isNullOrEmpty()) {
+                            val cleanText = text.lowercase().trim()
+                            if (_recognizedText.value != cleanText) {
+                                 _recognizedText.value = cleanText
+                            }
+                        }
+                        
+                        if (recognizer?.isEndpoint(stream) == true) {
+                             recognizer?.reset(stream)
+                        }
                     }
                 }
             }
+        } catch (e: Exception) {
+            Log.e("VoiceManager", "Error recording", e)
+            stopListening()
         }
     }
 
@@ -195,59 +198,38 @@ class VoiceManager(private val context: Context) {
         try {
             audioRecord?.stop()
             audioRecord?.release()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error stopping AudioRecord", e)
-        }
+        } catch (e: Exception) {}
         audioRecord = null
     }
 
     fun speak(text: String) {
-        if (tts == null) {
-            Log.e("VoiceManager", "TTS not initialized")
-            return
-        }
+        if (tts == null) return
+        val wasListening = isRecording
+        if (wasListening) stopListening()
+
         scope.launch {
             try {
-                // sid=0 is default speaker ID
                 val audio = tts?.generate(text, sid = 0, speed = 1.0f)
-                if (audio != null) {
-                    val samples = audio.samples
-                    val sampleRate = audio.sampleRate
-                    playAudio(samples, sampleRate)
-                } else {
-                    Log.e("VoiceManager", "TTS generation returned null")
+                if (audio != null) playAudio(audio.samples, audio.sampleRate)
+                if (wasListening) {
+                    delay(500)
+                    startListening()
                 }
             } catch (e: Exception) {
                 Log.e("VoiceManager", "Error speaking", e)
             }
         }
     }
-    
-    private fun playAudio(samples: FloatArray, sampleRate: Int) {
-         val bufferSize = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
-        )
-        if (bufferSize <= 0) {
-             Log.e("VoiceManager", "Invalid AudioTrack buffer size")
-             return
-        }
 
+    private fun playAudio(samples: FloatArray, sampleRate: Int) {
+        val minBuff = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+        val bufferSize = maxOf(minBuff, samples.size * 4)
         val track = AudioTrack.Builder()
-            .setAudioAttributes(android.media.AudioAttributes.Builder()
-                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build())
-            .setAudioFormat(AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                .setSampleRate(sampleRate)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build())
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_FLOAT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
             .setBufferSizeInBytes(bufferSize)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-            
         track.play()
         track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
         track.stop()
@@ -262,19 +244,56 @@ class VoiceManager(private val context: Context) {
         tts?.release()
     }
 
-    private fun copyAsset(filename: String): String? {
+    // Helper to copy a single file
+    private fun copyAssetFile(filename: String): String? {
         val file = File(context.filesDir, filename)
-        if (file.exists()) return file.absolutePath
+        if (file.exists() && file.length() > 0) return file.absolutePath
         return try {
             context.assets.open(filename).use { input ->
-                FileOutputStream(file).use { output ->
-                    input.copyTo(output)
-                }
+                FileOutputStream(file).use { output -> input.copyTo(output) }
             }
             file.absolutePath
         } catch (e: IOException) {
-            Log.e("VoiceManager", "Failed to copy asset $filename", e)
+            Log.e("VoiceManager", "Failed to copy $filename", e)
             null
+        }
+    }
+
+    // Helper to copy a full folder (Recursive)
+    private fun copyAssetFolder(path: String): String? {
+        try {
+            val fileList = context.assets.list(path) ?: return null
+            if (fileList.isEmpty()) return null // It's a file or empty
+
+            val targetDir = File(context.filesDir, path)
+            if (!targetDir.exists()) targetDir.mkdirs()
+
+            // Agar folder pehle se hai, to assume karte hain copy ho chuka hai (Startup speed ke liye)
+            // Agar update karna ho to version check lagana padega
+            if (targetDir.list()?.isNotEmpty() == true) {
+                Log.d("VoiceManager", "Folder $path already exists, skipping copy.")
+                return targetDir.absolutePath
+            }
+
+            for (filename in fileList) {
+                val fullPath = if (path.isEmpty()) filename else "$path/$filename"
+                // Check if it's a subfolder
+                if (context.assets.list(fullPath)?.isNotEmpty() == true) {
+                    copyAssetFolder(fullPath)
+                } else {
+                    // It's a file, copy it
+                    context.assets.open(fullPath).use { input ->
+                        File(targetDir, filename).outputStream().use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                }
+            }
+            Log.d("VoiceManager", "Copied folder: $path")
+            return targetDir.absolutePath
+        } catch (e: IOException) {
+            Log.e("VoiceManager", "Error copying folder $path", e)
+            return null
         }
     }
 }
